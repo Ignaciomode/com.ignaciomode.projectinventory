@@ -1,0 +1,19 @@
+{
+  "name": "com.ignaciomode.projectinventory",
+  "version": "1.0.0",
+  "displayName": "Project Inventory",
+  "description": "Editor window to browse, search, filter and inspect every asset in the project: thumbnail grid / list, type, folder and label filters, interactive previews, metadata, labels, dependencies, reverse references (Used By) and unreferenced-asset detection.",
+  "unity": "6000.0",
+  "keywords": [
+    "editor",
+    "assets",
+    "inventory",
+    "search",
+    "browser",
+    "references"
+  ],
+  "author": {
+    "name": "Ignacio Manuel Castro",
+    "email": "nachocastro62@gmail.com"
+  }
+}
