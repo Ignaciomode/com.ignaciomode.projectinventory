@@ -40,6 +40,7 @@ namespace ProjectInventory.Editor
         [SerializeField] bool gridMode = true;
         [SerializeField] float tileSize = 96f;
         [SerializeField] bool showTitles = true;
+        [SerializeField] bool showPreview = true;
         [SerializeField] bool includePackages;
         [SerializeField] bool syncSelection;
         [SerializeField] bool autoPlayAudio;
@@ -190,7 +191,8 @@ namespace ProjectInventory.Editor
             var split1 = new Rect(sidebarRect.xMax, bodyY, SplitterWidth, bodyH);
             var detailsRect = new Rect(position.width - detailsWidth, bodyY, detailsWidth, bodyH);
             var split2 = new Rect(detailsRect.x - SplitterWidth, bodyY, SplitterWidth, bodyH);
-            var resultsRect = new Rect(split1.xMax, bodyY, split2.x - split1.xMax, bodyH);
+            float resultsRight = showPreview ? split2.x : position.width;
+            var resultsRect = new Rect(split1.xMax, bodyY, resultsRight - split1.xMax, bodyH);
             var statusRect = new Rect(0, position.height - StatusHeight, position.width, StatusHeight);
 
             HandleSplitters(split1, split2);
@@ -199,12 +201,13 @@ namespace ProjectInventory.Editor
             DrawToolbar(toolbarRect);
             DrawSidebar(sidebarRect);
             DrawResults(resultsRect);
-            DrawDetails(detailsRect);
+            if (showPreview) DrawDetails(detailsRect);
             DrawStatusBar(statusRect);
 
             var line = EditorGUIUtility.isProSkin ? new Color(0.1f, 0.1f, 0.1f) : new Color(0.6f, 0.6f, 0.6f);
             EditorGUI.DrawRect(new Rect(split1.x + 1, split1.y, 1, split1.height), line);
-            EditorGUI.DrawRect(new Rect(split2.x + 2, split2.y, 1, split2.height), line);
+            if (showPreview)
+                EditorGUI.DrawRect(new Rect(split2.x + 2, split2.y, 1, split2.height), line);
 
             if (needsRepaint || AssetPreview.IsLoadingAssetPreviews()) Repaint();
         }
@@ -212,12 +215,12 @@ namespace ProjectInventory.Editor
         void HandleSplitters(Rect s1, Rect s2)
         {
             EditorGUIUtility.AddCursorRect(s1, MouseCursor.ResizeHorizontal);
-            EditorGUIUtility.AddCursorRect(s2, MouseCursor.ResizeHorizontal);
+            if (showPreview) EditorGUIUtility.AddCursorRect(s2, MouseCursor.ResizeHorizontal);
             var e = Event.current;
             if (e.type == EventType.MouseDown && e.button == 0)
             {
                 if (s1.Contains(e.mousePosition)) { activeSplitter = Splitter.Sidebar; e.Use(); }
-                else if (s2.Contains(e.mousePosition)) { activeSplitter = Splitter.Details; e.Use(); }
+                else if (showPreview && s2.Contains(e.mousePosition)) { activeSplitter = Splitter.Details; e.Use(); }
             }
             else if (activeSplitter != Splitter.None && e.type == EventType.MouseDrag)
             {
@@ -287,6 +290,15 @@ namespace ProjectInventory.Editor
                 RebuildIndex();
             });
             menu.AddItem(new GUIContent("Show Tile Titles"), showTitles, () => showTitles = !showTitles);
+            menu.AddItem(new GUIContent("Show Preview"), showPreview, () =>
+            {
+                showPreview = !showPreview;
+                if (!showPreview)
+                {
+                    DestroyPreviewEditor();
+                    detailsGuid = null;
+                }
+            });
             menu.AddItem(new GUIContent("Sync Unity Selection"), syncSelection, () => syncSelection = !syncSelection);
             menu.AddItem(new GUIContent("Auto-play Audio"), autoPlayAudio, () => autoPlayAudio = !autoPlayAudio);
             menu.AddSeparator("");
