@@ -27,10 +27,13 @@ namespace ProjectInventory.Editor
         const float SplitterWidth = 4f;
         const float Spacing = 6f;
         const float ListRowHeight = 20f;
+        const string UngroupedFilter = "__ungrouped__";
 
         // ---- persisted UI state -------------------------------------------------
         [SerializeField] string searchText = "";
         [SerializeField] int categoryMask; // 0 == all
+        [SerializeField] string groupFilter = "";
+        [SerializeField] List<string> excludedGroups = new();
         [SerializeField] string folderFilter = "";
         [SerializeField] string labelFilter = "";
         [SerializeField] int minSizeIndex;
@@ -44,18 +47,22 @@ namespace ProjectInventory.Editor
         [SerializeField] bool includePackages;
         [SerializeField] bool syncSelection;
         [SerializeField] bool autoPlayAudio;
+        [SerializeField] bool showSidebar = true;
         [SerializeField] float sidebarWidth = 190f;
         [SerializeField] float detailsWidth = 320f;
         [SerializeField] List<string> selection = new();
         [SerializeField] Vector2 resultsScroll, sidebarScroll, detailsScroll;
-        [SerializeField] bool foldTypes = true, foldFolders = true, foldLabels = true, foldFilters = true;
+        [SerializeField] bool foldGroups = true, foldTypes = true, foldFolders = true, foldLabels = true, foldFilters = true;
         [SerializeField] bool foldDeps = true, foldUsedBy = true;
+        [SerializeField] List<string> collapsedGroups = new();
 
         // ---- runtime state --------------------------------------------------------
         SearchField searchField;
         List<InventoryItem> filtered = new();
         bool filterDirty = true;
         readonly Dictionary<AssetCategory, int> categoryCounts = new();
+        readonly SortedDictionary<string, int> groupCounts = new(StringComparer.OrdinalIgnoreCase);
+        int ungroupedCount;
         readonly SortedDictionary<string, int> folderCounts = new(StringComparer.OrdinalIgnoreCase);
         readonly SortedDictionary<string, int> labelCounts = new(StringComparer.OrdinalIgnoreCase);
 
@@ -71,6 +78,12 @@ namespace ProjectInventory.Editor
         int lastCols = 1;
         float lastCellHeight = 100f, lastViewHeight = 100f;
         string newLabel = "";
+        string newGroup = "";
+        bool isCreatingGroup;
+        string renamingGroupPath;
+        string editingGroupText = "";
+        bool focusGroupField;
+        List<string> pendingGroupAddGuids;
 
         // details cache
         string detailsGuid;
@@ -88,7 +101,7 @@ namespace ProjectInventory.Editor
         public static ProjectInventoryWindow Open()
         {
             var w = GetWindow<ProjectInventoryWindow>();
-            w.minSize = new Vector2(720, 360);
+            w.minSize = new Vector2(260, 200);
             w.Show();
             return w;
         }
@@ -113,6 +126,7 @@ namespace ProjectInventory.Editor
             searchField = new SearchField();
             AssetPreview.SetPreviewTextureCacheSize(1024);
             InventoryIndex.Changed += OnIndexChanged;
+            InventoryGroups.Changed += OnGroupsChanged;
 
             if (InventoryIndex.IsDirty || InventoryIndex.Items.Count == 0)
                 EditorApplication.delayCall += RebuildIndex;
@@ -123,6 +137,7 @@ namespace ProjectInventory.Editor
         void OnDisable()
         {
             InventoryIndex.Changed -= OnIndexChanged;
+            InventoryGroups.Changed -= OnGroupsChanged;
             DestroyPreviewEditor();
             InventoryAudio.Stop();
         }
@@ -132,6 +147,16 @@ namespace ProjectInventory.Editor
             thumbs.Clear();
             noPreview.Clear();
             detailsGuid = null; // force details refresh
+            RecountSidebar();
+            filterDirty = true;
+            Repaint();
+        }
+
+        void OnGroupsChanged()
+        {
+            if (!string.IsNullOrEmpty(groupFilter) && groupFilter != UngroupedFilter && !InventoryGroups.Exists(groupFilter))
+                groupFilter = "";
+            excludedGroups.RemoveAll(g => !InventoryGroups.Exists(g));
             RecountSidebar();
             filterDirty = true;
             Repaint();
@@ -181,32 +206,56 @@ namespace ProjectInventory.Editor
             needsRepaint = false;
             if (filterDirty) RefreshFilter();
 
-            float bodyY = ToolbarHeight;
-            float bodyH = position.height - ToolbarHeight - StatusHeight;
-            sidebarWidth = Mathf.Clamp(sidebarWidth, 120f, position.width * 0.35f);
-            detailsWidth = Mathf.Clamp(detailsWidth, 220f, position.width * 0.55f);
+            bool isNarrow = position.width < 540f;
+            float currentToolbarHeight = isNarrow ? (ToolbarHeight * 2) : ToolbarHeight;
+            float bodyY = currentToolbarHeight;
+            float bodyH = position.height - currentToolbarHeight - StatusHeight;
 
-            var toolbarRect = new Rect(0, 0, position.width, ToolbarHeight);
-            var sidebarRect = new Rect(0, bodyY, sidebarWidth, bodyH);
-            var split1 = new Rect(sidebarRect.xMax, bodyY, SplitterWidth, bodyH);
-            var detailsRect = new Rect(position.width - detailsWidth, bodyY, detailsWidth, bodyH);
-            var split2 = new Rect(detailsRect.x - SplitterWidth, bodyY, SplitterWidth, bodyH);
-            float resultsRight = showPreview ? split2.x : position.width;
-            var resultsRect = new Rect(split1.xMax, bodyY, resultsRight - split1.xMax, bodyH);
+            bool drawSidebar = showSidebar;
+            bool drawDetails = showPreview;
+
+            float effSidebarWidth = 0f;
+            if (drawSidebar)
+            {
+                float maxSidebar = Mathf.Max(60f, position.width * 0.4f);
+                float minSidebar = Mathf.Min(100f, maxSidebar);
+                sidebarWidth = Mathf.Clamp(sidebarWidth, minSidebar, maxSidebar);
+                effSidebarWidth = sidebarWidth;
+            }
+
+            float effDetailsWidth = 0f;
+            if (drawDetails)
+            {
+                float remainingForDetails = position.width - effSidebarWidth - (drawSidebar ? SplitterWidth : 0f) - 60f;
+                float maxDetails = Mathf.Max(80f, Mathf.Min(position.width * 0.55f, remainingForDetails));
+                float minDetails = Mathf.Min(140f, maxDetails);
+                detailsWidth = Mathf.Clamp(detailsWidth, minDetails, maxDetails);
+                effDetailsWidth = detailsWidth;
+            }
+
+            var toolbarRect = new Rect(0, 0, position.width, currentToolbarHeight);
+            var sidebarRect = new Rect(0, bodyY, effSidebarWidth, bodyH);
+            var split1 = new Rect(sidebarRect.xMax, bodyY, drawSidebar ? SplitterWidth : 0f, bodyH);
+            var detailsRect = new Rect(position.width - effDetailsWidth, bodyY, effDetailsWidth, bodyH);
+            var split2 = new Rect(detailsRect.x - (drawDetails ? SplitterWidth : 0f), bodyY, drawDetails ? SplitterWidth : 0f, bodyH);
+            float resultsRight = drawDetails ? split2.x : position.width;
+            float resultsLeft = drawSidebar ? split1.xMax : 0f;
+            var resultsRect = new Rect(resultsLeft, bodyY, Mathf.Max(0f, resultsRight - resultsLeft), bodyH);
             var statusRect = new Rect(0, position.height - StatusHeight, position.width, StatusHeight);
 
             HandleSplitters(split1, split2);
             HandleKeyboard();
 
             DrawToolbar(toolbarRect);
-            DrawSidebar(sidebarRect);
+            if (drawSidebar) DrawSidebar(sidebarRect);
             DrawResults(resultsRect);
-            if (showPreview) DrawDetails(detailsRect);
+            if (drawDetails) DrawDetails(detailsRect);
             DrawStatusBar(statusRect);
 
             var line = EditorGUIUtility.isProSkin ? new Color(0.1f, 0.1f, 0.1f) : new Color(0.6f, 0.6f, 0.6f);
-            EditorGUI.DrawRect(new Rect(split1.x + 1, split1.y, 1, split1.height), line);
-            if (showPreview)
+            if (drawSidebar)
+                EditorGUI.DrawRect(new Rect(split1.x + 1, split1.y, 1, split1.height), line);
+            if (drawDetails)
                 EditorGUI.DrawRect(new Rect(split2.x + 2, split2.y, 1, split2.height), line);
 
             if (needsRepaint || AssetPreview.IsLoadingAssetPreviews()) Repaint();
@@ -214,12 +263,12 @@ namespace ProjectInventory.Editor
 
         void HandleSplitters(Rect s1, Rect s2)
         {
-            EditorGUIUtility.AddCursorRect(s1, MouseCursor.ResizeHorizontal);
+            if (showSidebar) EditorGUIUtility.AddCursorRect(s1, MouseCursor.ResizeHorizontal);
             if (showPreview) EditorGUIUtility.AddCursorRect(s2, MouseCursor.ResizeHorizontal);
             var e = Event.current;
             if (e.type == EventType.MouseDown && e.button == 0)
             {
-                if (s1.Contains(e.mousePosition)) { activeSplitter = Splitter.Sidebar; e.Use(); }
+                if (showSidebar && s1.Contains(e.mousePosition)) { activeSplitter = Splitter.Sidebar; e.Use(); }
                 else if (showPreview && s2.Contains(e.mousePosition)) { activeSplitter = Splitter.Details; e.Use(); }
             }
             else if (activeSplitter != Splitter.None && e.type == EventType.MouseDrag)
@@ -239,44 +288,102 @@ namespace ProjectInventory.Editor
         void DrawToolbar(Rect rect)
         {
             GUILayout.BeginArea(rect);
-            using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
+            if (rect.width >= 540f)
             {
-                if (GUILayout.Button(new GUIContent(EditorGUIUtility.IconContent("Refresh").image, "Re-index the project"),
-                        EditorStyles.toolbarButton, GUILayout.Width(28)))
-                    RebuildIndex();
+                using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
+                {
+                    if (GUILayout.Button(new GUIContent(EditorGUIUtility.IconContent("Refresh").image, "Re-index the project"),
+                            EditorStyles.toolbarButton, GUILayout.Width(28)))
+                        RebuildIndex();
 
-                GUILayout.Space(4);
-                EditorGUI.BeginChangeCheck();
-                searchText = searchField.OnToolbarGUI(searchText, GUILayout.ExpandWidth(true), GUILayout.MinWidth(120));
-                if (EditorGUI.EndChangeCheck()) filterDirty = true;
+                    GUILayout.Space(4);
+                    EditorGUI.BeginChangeCheck();
+                    searchText = searchField.OnToolbarGUI(searchText, GUILayout.ExpandWidth(true), GUILayout.MinWidth(80));
+                    if (EditorGUI.EndChangeCheck()) filterDirty = true;
 
-                var help = new GUIContent("?",
-                    "Search syntax (space separated, all must match):\n" +
-                    "  word        name or path contains word\n" +
-                    "  -word       exclude\n" +
-                    "  t:texture   category or type name\n" +
-                    "  l:label     asset label\n" +
-                    "  ext:png     file extension\n" +
-                    "  dir:ui      folder contains");
-                GUILayout.Label(help, EditorStyles.toolbarButton, GUILayout.Width(18));
+                    var help = new GUIContent("?",
+                        "Search syntax (space separated, all must match):\n" +
+                        "  word        name or path contains word\n" +
+                        "  -word       exclude\n" +
+                        "  t:texture   category or type name\n" +
+                        "  g:park      inventory group (use -g:park to exclude)\n" +
+                        "  l:label     asset label\n" +
+                        "  ext:png     file extension\n" +
+                        "  dir:ui      folder contains");
+                    GUILayout.Label(help, EditorStyles.toolbarButton, GUILayout.Width(18));
 
-                GUILayout.Space(6);
-                EditorGUI.BeginChangeCheck();
-                sortMode = (SortMode)EditorGUILayout.EnumPopup(sortMode, EditorStyles.toolbarPopup, GUILayout.Width(80));
-                if (GUILayout.Button(new GUIContent(sortDescending ? "▼" : "▲", "Sort direction"),
-                        EditorStyles.toolbarButton, GUILayout.Width(22)))
-                    sortDescending = !sortDescending;
-                if (EditorGUI.EndChangeCheck()) filterDirty = true;
+                    GUILayout.Space(6);
+                    EditorGUI.BeginChangeCheck();
+                    sortMode = (SortMode)EditorGUILayout.EnumPopup(sortMode, EditorStyles.toolbarPopup, GUILayout.Width(80));
+                    if (GUILayout.Button(new GUIContent(sortDescending ? "▼" : "▲", "Sort direction"),
+                            EditorStyles.toolbarButton, GUILayout.Width(22)))
+                        sortDescending = !sortDescending;
+                    if (EditorGUI.EndChangeCheck()) filterDirty = true;
 
-                GUILayout.Space(6);
-                if (GUILayout.Toggle(gridMode, "Grid", EditorStyles.toolbarButton, GUILayout.Width(38))) gridMode = true;
-                if (GUILayout.Toggle(!gridMode, "List", EditorStyles.toolbarButton, GUILayout.Width(38))) gridMode = false;
-                using (new EditorGUI.DisabledScope(!gridMode))
-                    tileSize = GUILayout.HorizontalSlider(tileSize, 48f, 256f, GUILayout.Width(90));
+                    GUILayout.Space(6);
+                    if (GUILayout.Toggle(gridMode, "Grid", EditorStyles.toolbarButton, GUILayout.Width(38))) gridMode = true;
+                    if (GUILayout.Toggle(!gridMode, "List", EditorStyles.toolbarButton, GUILayout.Width(38))) gridMode = false;
+                    using (new EditorGUI.DisabledScope(!gridMode))
+                        tileSize = GUILayout.HorizontalSlider(tileSize, 48f, 256f, GUILayout.Width(90));
 
-                GUILayout.Space(6);
-                if (GUILayout.Button(EditorGUIUtility.IconContent("_Popup"), EditorStyles.toolbarButton, GUILayout.Width(26)))
-                    ShowSettingsMenu();
+                    GUILayout.Space(6);
+                    if (GUILayout.Button(EditorGUIUtility.IconContent("_Popup"), EditorStyles.toolbarButton, GUILayout.Width(26)))
+                        ShowSettingsMenu();
+                }
+            }
+            else
+            {
+                // Multi-row toolbar for narrow layouts (e.g. docked in right column or lower right)
+                using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
+                {
+                    if (GUILayout.Button(new GUIContent(EditorGUIUtility.IconContent("Refresh").image, "Re-index the project"),
+                            EditorStyles.toolbarButton, GUILayout.Width(26)))
+                        RebuildIndex();
+
+                    GUILayout.Space(2);
+                    EditorGUI.BeginChangeCheck();
+                    searchText = searchField.OnToolbarGUI(searchText, GUILayout.ExpandWidth(true), GUILayout.MinWidth(50));
+                    if (EditorGUI.EndChangeCheck()) filterDirty = true;
+
+                    var help = new GUIContent("?",
+                        "Search syntax (space separated, all must match):\n" +
+                        "  word        name or path contains word\n" +
+                        "  -word       exclude\n" +
+                        "  t:texture   category or type name\n" +
+                        "  g:park      inventory group (use -g:park to exclude)\n" +
+                        "  l:label     asset label\n" +
+                        "  ext:png     file extension\n" +
+                        "  dir:ui      folder contains");
+                    GUILayout.Label(help, EditorStyles.toolbarButton, GUILayout.Width(18));
+
+                    GUILayout.Space(2);
+                    if (GUILayout.Button(EditorGUIUtility.IconContent("_Popup"), EditorStyles.toolbarButton, GUILayout.Width(24)))
+                        ShowSettingsMenu();
+                }
+
+                using (new EditorGUILayout.HorizontalScope(EditorStyles.toolbar))
+                {
+                    EditorGUI.BeginChangeCheck();
+                    sortMode = (SortMode)EditorGUILayout.EnumPopup(sortMode, EditorStyles.toolbarPopup, GUILayout.Width(Mathf.Clamp(rect.width * 0.28f, 65f, 85f)));
+                    if (GUILayout.Button(new GUIContent(sortDescending ? "▼" : "▲", "Sort direction"),
+                            EditorStyles.toolbarButton, GUILayout.Width(20)))
+                        sortDescending = !sortDescending;
+                    if (EditorGUI.EndChangeCheck()) filterDirty = true;
+
+                    GUILayout.Space(4);
+                    if (GUILayout.Toggle(gridMode, "Grid", EditorStyles.toolbarButton, GUILayout.Width(34))) gridMode = true;
+                    if (GUILayout.Toggle(!gridMode, "List", EditorStyles.toolbarButton, GUILayout.Width(34))) gridMode = false;
+
+                    if (gridMode)
+                    {
+                        GUILayout.Space(2);
+                        tileSize = GUILayout.HorizontalSlider(tileSize, 48f, 256f, GUILayout.MinWidth(40), GUILayout.MaxWidth(120));
+                    }
+                    else
+                    {
+                        GUILayout.FlexibleSpace();
+                    }
+                }
             }
             GUILayout.EndArea();
         }
@@ -284,13 +391,8 @@ namespace ProjectInventory.Editor
         void ShowSettingsMenu()
         {
             var menu = new GenericMenu();
-            menu.AddItem(new GUIContent("Include Packages"), includePackages, () =>
-            {
-                includePackages = !includePackages;
-                RebuildIndex();
-            });
-            menu.AddItem(new GUIContent("Show Tile Titles"), showTitles, () => showTitles = !showTitles);
-            menu.AddItem(new GUIContent("Show Preview"), showPreview, () =>
+            menu.AddItem(new GUIContent("Show Sidebar"), showSidebar, () => showSidebar = !showSidebar);
+            menu.AddItem(new GUIContent("Show Preview & Details"), showPreview, () =>
             {
                 showPreview = !showPreview;
                 if (!showPreview)
@@ -298,6 +400,32 @@ namespace ProjectInventory.Editor
                     DestroyPreviewEditor();
                     detailsGuid = null;
                 }
+            });
+            menu.AddItem(new GUIContent("Show Tile Titles"), showTitles, () => showTitles = !showTitles);
+            menu.AddSeparator("");
+            menu.AddItem(new GUIContent("View/Grid Mode"), gridMode, () => gridMode = true);
+            menu.AddItem(new GUIContent("View/List Mode"), !gridMode, () => gridMode = false);
+
+            foreach (SortMode mode in (SortMode[])Enum.GetValues(typeof(SortMode)))
+            {
+                SortMode m = mode;
+                menu.AddItem(new GUIContent($"Sort By/{m}"), sortMode == m, () =>
+                {
+                    sortMode = m;
+                    filterDirty = true;
+                });
+            }
+            menu.AddItem(new GUIContent("Sort Descending"), sortDescending, () =>
+            {
+                sortDescending = !sortDescending;
+                filterDirty = true;
+            });
+
+            menu.AddSeparator("");
+            menu.AddItem(new GUIContent("Include Packages"), includePackages, () =>
+            {
+                includePackages = !includePackages;
+                RebuildIndex();
             });
             menu.AddItem(new GUIContent("Sync Unity Selection"), syncSelection, () => syncSelection = !syncSelection);
             menu.AddItem(new GUIContent("Auto-play Audio"), autoPlayAudio, () => autoPlayAudio = !autoPlayAudio);
@@ -316,8 +444,16 @@ namespace ProjectInventory.Editor
         void RecountSidebar()
         {
             categoryCounts.Clear();
+            groupCounts.Clear();
+            ungroupedCount = 0;
             folderCounts.Clear();
             labelCounts.Clear();
+
+            foreach (var g in InventoryGroups.AllGroups)
+                groupCounts[g] = 0;
+
+            var seenGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             foreach (var i in InventoryIndex.Items)
             {
                 categoryCounts.TryGetValue(i.Category, out int c);
@@ -329,6 +465,30 @@ namespace ProjectInventory.Editor
                     labelCounts.TryGetValue(l, out int lc);
                     labelCounts[l] = lc + 1;
                 }
+
+                var itemGroups = InventoryGroups.GetGroupsForAsset(i.Guid);
+                if (itemGroups.Count == 0)
+                {
+                    ungroupedCount++;
+                }
+                else
+                {
+                    seenGroups.Clear();
+                    for (int idx = 0; idx < itemGroups.Count; idx++)
+                    {
+                        string gp = itemGroups[idx];
+                        while (!string.IsNullOrEmpty(gp))
+                        {
+                            seenGroups.Add(gp);
+                            gp = InventoryGroups.GetParentPath(gp);
+                        }
+                    }
+                    foreach (var gp in seenGroups)
+                    {
+                        groupCounts.TryGetValue(gp, out int gc);
+                        groupCounts[gp] = gc + 1;
+                    }
+                }
             }
         }
 
@@ -336,6 +496,8 @@ namespace ProjectInventory.Editor
         {
             GUILayout.BeginArea(rect);
             sidebarScroll = GUILayout.BeginScrollView(sidebarScroll);
+
+            DrawGroupsSidebar();
 
             foldTypes = EditorGUILayout.BeginFoldoutHeaderGroup(foldTypes, "Types");
             if (foldTypes)
@@ -427,6 +589,382 @@ namespace ProjectInventory.Editor
             GUILayout.EndArea();
         }
 
+        void DrawGroupsSidebar()
+        {
+            foldGroups = EditorGUILayout.BeginFoldoutHeaderGroup(foldGroups, "Groups");
+            if (!foldGroups)
+            {
+                EditorGUILayout.EndFoldoutHeaderGroup();
+                return;
+            }
+
+            var folderIcon = EditorGUIUtility.IconContent("Folder Icon").image;
+            if (SidebarRow("All", InventoryIndex.Items.Count, string.IsNullOrEmpty(groupFilter) && excludedGroups.Count == 0, null))
+            {
+                groupFilter = "";
+                excludedGroups.Clear();
+                filterDirty = true;
+            }
+
+            if (InventoryGroups.GroupCount > 0)
+            {
+                if (SidebarRow("Ungrouped", ungroupedCount, groupFilter == UngroupedFilter, null))
+                {
+                    groupFilter = groupFilter == UngroupedFilter ? "" : UngroupedFilter;
+                    filterDirty = true;
+                }
+            }
+
+            foreach (var groupPath in InventoryGroups.AllGroups.ToList())
+            {
+                if (IsAncestorCollapsed(groupPath)) continue;
+
+                if (string.Equals(renamingGroupPath, groupPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    DrawInlineGroupEditor(isRename: true);
+                    continue;
+                }
+
+                groupCounts.TryGetValue(groupPath, out int count);
+                bool selected = string.Equals(groupFilter, groupPath, StringComparison.OrdinalIgnoreCase);
+                bool excluded = IsGroupExcluded(groupPath);
+                int depth = InventoryGroups.GetDepth(groupPath);
+                bool hasChildren = InventoryGroups.HasSubgroups(groupPath);
+                bool isCollapsed = collapsedGroups.Any(c => string.Equals(c, groupPath, StringComparison.OrdinalIgnoreCase));
+
+                GroupSidebarRow(groupPath, count, selected, excluded, depth, hasChildren, !isCollapsed, folderIcon);
+            }
+
+            if (isCreatingGroup)
+            {
+                DrawInlineGroupEditor(isRename: false);
+            }
+            else
+            {
+                var btnRect = GUILayoutUtility.GetRect(0, 20, GUILayout.ExpandWidth(true));
+                btnRect.xMin += 6;
+                btnRect.xMax -= 6;
+                btnRect.yMin += 2;
+
+                HandleDropOnNewGroupButton(btnRect);
+
+                if (GUI.Button(btnRect, new GUIContent("+ New Group", "Create an inventory-only group or nested folder (e.g. Environment/Park). Drag assets here to group them."), EditorStyles.miniButton))
+                {
+                    StartCreateGroup("", null);
+                }
+            }
+
+            EditorGUILayout.EndFoldoutHeaderGroup();
+        }
+
+        bool IsAncestorCollapsed(string groupPath)
+        {
+            string parent = InventoryGroups.GetParentPath(groupPath);
+            while (!string.IsNullOrEmpty(parent))
+            {
+                if (collapsedGroups.Any(c => string.Equals(c, parent, StringComparison.OrdinalIgnoreCase)))
+                    return true;
+                parent = InventoryGroups.GetParentPath(parent);
+            }
+            return false;
+        }
+
+        void ToggleGroupCollapsed(string groupPath, bool collapse)
+        {
+            collapsedGroups.RemoveAll(c => string.Equals(c, groupPath, StringComparison.OrdinalIgnoreCase));
+            if (collapse) collapsedGroups.Add(groupPath);
+        }
+
+        void ExpandAncestors(string groupPath)
+        {
+            string parent = InventoryGroups.GetParentPath(groupPath);
+            while (!string.IsNullOrEmpty(parent))
+            {
+                ToggleGroupCollapsed(parent, false);
+                parent = InventoryGroups.GetParentPath(parent);
+            }
+        }
+
+        bool IsGroupExcluded(string groupPath) =>
+            excludedGroups.Any(g => string.Equals(g, groupPath, StringComparison.OrdinalIgnoreCase));
+
+        void ToggleGroupExcluded(string groupPath)
+        {
+            int removed = excludedGroups.RemoveAll(g => string.Equals(g, groupPath, StringComparison.OrdinalIgnoreCase));
+            if (removed == 0)
+            {
+                excludedGroups.Add(groupPath);
+                if (string.Equals(groupFilter, groupPath, StringComparison.OrdinalIgnoreCase))
+                    groupFilter = "";
+            }
+            filterDirty = true;
+        }
+
+        void GroupSidebarRow(string groupPath, int count, bool selected, bool excluded, int depth, bool hasChildren, bool expanded, Texture icon)
+        {
+            var r = GUILayoutUtility.GetRect(0, 18, GUILayout.ExpandWidth(true));
+            var e = Event.current;
+            bool isHover = r.Contains(e.mousePosition);
+
+            bool isDragHover = (e.type == EventType.DragUpdated || e.type == EventType.DragPerform) &&
+                               isHover && HasDraggableAssets();
+
+            if (isDragHover) EditorGUI.DrawRect(r, SelectionColor(0.65f));
+            else if (selected) EditorGUI.DrawRect(r, SelectionColor(0.45f));
+            else if (excluded) EditorGUI.DrawRect(r, new Color(0.75f, 0.22f, 0.22f, 0.42f));
+            else if (isHover) EditorGUI.DrawRect(r, new Color(1, 1, 1, 0.05f));
+
+            float x = r.x + 6 + depth * 12f;
+            var foldRect = new Rect(x, r.y + 1, 12, 16);
+            if (hasChildren)
+            {
+                GUI.Label(foldRect, expanded ? "▾" : "▸", EditorStyles.miniLabel);
+            }
+            x += 12;
+
+            if (icon != null)
+            {
+                GUI.DrawTexture(new Rect(x, r.y + 1, 16, 16), icon, ScaleMode.ScaleToFit);
+                x += 18;
+            }
+
+            bool showExcludeBtn = excluded || (isHover && !isDragHover);
+            var excludeBtnRect = new Rect(r.xMax - 18, r.y + 2, 14, 14);
+            float rightMargin = showExcludeBtn ? 54f : 44f;
+
+            string leaf = InventoryGroups.GetLeafName(groupPath);
+            string displayLabel = excluded ? "− " + leaf : leaf;
+            string tooltip = $"{groupPath}\nClick to filter · Alt-click or '−' to exclude";
+            GUI.Label(new Rect(x, r.y, r.xMax - x - rightMargin, r.height), new GUIContent(displayLabel, tooltip));
+            GUI.Label(new Rect(r.xMax - rightMargin - 4, r.y, 40, r.height), count.ToString(), countStyle);
+
+            if (showExcludeBtn)
+            {
+                if (excluded || excludeBtnRect.Contains(e.mousePosition))
+                    EditorGUI.DrawRect(excludeBtnRect, excluded ? new Color(0.85f, 0.25f, 0.25f, 0.85f) : new Color(1f, 1f, 1f, 0.15f));
+                GUI.Label(excludeBtnRect, new GUIContent("−", excluded ? "Stop excluding this group" : "Exclude this group"), badgeStyle);
+            }
+
+            if (isDragHover)
+            {
+                DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+                if (e.type == EventType.DragPerform)
+                {
+                    DragAndDrop.AcceptDrag();
+                    var guids = InventoryGroups.ExpandPathsToGuids(DragAndDrop.paths);
+                    InventoryGroups.AddAssets(groupPath, guids);
+                }
+                e.Use();
+                Repaint();
+                return;
+            }
+
+            if (e.type == EventType.MouseDown && isHover)
+            {
+                if (e.button == 0)
+                {
+                    if (hasChildren && foldRect.Contains(e.mousePosition))
+                    {
+                        ToggleGroupCollapsed(groupPath, expanded);
+                    }
+                    else if (showExcludeBtn && excludeBtnRect.Contains(e.mousePosition))
+                    {
+                        ToggleGroupExcluded(groupPath);
+                    }
+                    else if (e.alt)
+                    {
+                        ToggleGroupExcluded(groupPath);
+                    }
+                    else if (e.clickCount == 2)
+                    {
+                        StartRenameGroup(groupPath);
+                    }
+                    else
+                    {
+                        excludedGroups.RemoveAll(g => string.Equals(g, groupPath, StringComparison.OrdinalIgnoreCase));
+                        groupFilter = selected ? "" : groupPath;
+                        filterDirty = true;
+                    }
+                    e.Use();
+                }
+                else if (e.button == 1)
+                {
+                    ShowGroupSidebarMenu(groupPath);
+                    e.Use();
+                }
+            }
+        }
+
+        void HandleDropOnNewGroupButton(Rect rect)
+        {
+            var e = Event.current;
+            if ((e.type != EventType.DragUpdated && e.type != EventType.DragPerform) || !rect.Contains(e.mousePosition) || !HasDraggableAssets())
+                return;
+
+            DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            if (e.type == EventType.DragPerform)
+            {
+                DragAndDrop.AcceptDrag();
+                var guids = InventoryGroups.ExpandPathsToGuids(DragAndDrop.paths);
+                StartCreateGroup("", guids);
+            }
+            e.Use();
+            Repaint();
+        }
+
+        static bool HasDraggableAssets() =>
+            DragAndDrop.paths != null && DragAndDrop.paths.Length > 0;
+
+        void StartCreateGroup(string initialPath, List<string> guidsToAdd)
+        {
+            foldGroups = true;
+            renamingGroupPath = null;
+            isCreatingGroup = true;
+            editingGroupText = initialPath ?? "";
+            pendingGroupAddGuids = guidsToAdd;
+            focusGroupField = true;
+            Repaint();
+        }
+
+        void StartRenameGroup(string groupPath)
+        {
+            foldGroups = true;
+            isCreatingGroup = false;
+            renamingGroupPath = groupPath;
+            editingGroupText = groupPath;
+            pendingGroupAddGuids = null;
+            focusGroupField = true;
+            Repaint();
+        }
+
+        void CancelInlineGroupEdit()
+        {
+            isCreatingGroup = false;
+            renamingGroupPath = null;
+            editingGroupText = "";
+            pendingGroupAddGuids = null;
+            GUIUtility.keyboardControl = 0;
+            Repaint();
+        }
+
+        void ConfirmInlineGroupEdit()
+        {
+            string target = InventoryGroups.NormalizePath(editingGroupText);
+            if (string.IsNullOrEmpty(target))
+            {
+                CancelInlineGroupEdit();
+                return;
+            }
+
+            if (renamingGroupPath != null)
+            {
+                string old = renamingGroupPath;
+                string prevFilter = groupFilter;
+                var prevExcluded = excludedGroups.ToList();
+                if (InventoryGroups.RenameGroup(old, target))
+                {
+                    ExpandAncestors(target);
+                    if (string.Equals(prevFilter, old, StringComparison.OrdinalIgnoreCase))
+                        groupFilter = target;
+                    else if (prevFilter.StartsWith(old + "/", StringComparison.OrdinalIgnoreCase))
+                        groupFilter = target + prevFilter.Substring(old.Length);
+
+                    excludedGroups = prevExcluded.Select(ex =>
+                    {
+                        if (string.Equals(ex, old, StringComparison.OrdinalIgnoreCase)) return target;
+                        if (ex.StartsWith(old + "/", StringComparison.OrdinalIgnoreCase)) return target + ex.Substring(old.Length);
+                        return ex;
+                    }).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    filterDirty = true;
+                }
+            }
+            else
+            {
+                InventoryGroups.CreateGroup(target);
+                if (pendingGroupAddGuids != null && pendingGroupAddGuids.Count > 0)
+                    InventoryGroups.AddAssets(target, pendingGroupAddGuids);
+                ExpandAncestors(target);
+                groupFilter = target;
+                filterDirty = true;
+            }
+
+            CancelInlineGroupEdit();
+        }
+
+        void DrawInlineGroupEditor(bool isRename)
+        {
+            var e = Event.current;
+            if (e.type == EventType.KeyDown)
+            {
+                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
+                {
+                    e.Use();
+                    ConfirmInlineGroupEdit();
+                    return;
+                }
+                if (e.keyCode == KeyCode.Escape)
+                {
+                    e.Use();
+                    CancelInlineGroupEdit();
+                    return;
+                }
+            }
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUILayout.Space(6);
+                GUI.SetNextControlName("InventoryGroupInlineField");
+                editingGroupText = EditorGUILayout.TextField(editingGroupText);
+                if (focusGroupField)
+                {
+                    EditorGUI.FocusTextInControl("InventoryGroupInlineField");
+                    focusGroupField = false;
+                }
+                if (GUILayout.Button(new GUIContent("✓", isRename ? "Rename group" : "Create group"), EditorStyles.miniButton, GUILayout.Width(22)))
+                    ConfirmInlineGroupEdit();
+                if (GUILayout.Button(new GUIContent("×", "Cancel"), EditorStyles.miniButton, GUILayout.Width(22)))
+                    CancelInlineGroupEdit();
+                GUILayout.Space(4);
+            }
+        }
+
+        void ShowGroupSidebarMenu(string groupPath)
+        {
+            var menu = new GenericMenu();
+            bool isExcluded = IsGroupExcluded(groupPath);
+            menu.AddItem(new GUIContent("Exclude Group"), isExcluded, () => ToggleGroupExcluded(groupPath));
+            menu.AddSeparator("");
+            if (selection.Count > 0)
+            {
+                var selectedGuids = selection.ToList();
+                menu.AddItem(new GUIContent($"Add Selected Assets ({selectedGuids.Count})"), false,
+                    () => InventoryGroups.AddAssets(groupPath, selectedGuids));
+                menu.AddItem(new GUIContent("Remove Selected Assets"), false,
+                    () => InventoryGroups.RemoveAssets(groupPath, selectedGuids, includeSubgroups: false));
+            }
+            else
+            {
+                menu.AddDisabledItem(new GUIContent("Add Selected Assets"));
+                menu.AddDisabledItem(new GUIContent("Remove Selected Assets"));
+            }
+
+            menu.AddSeparator("");
+            menu.AddItem(new GUIContent("New Sub-group…"), false, () => StartCreateGroup(groupPath + "/", null));
+            menu.AddItem(new GUIContent("Rename…"), false, () => StartRenameGroup(groupPath));
+            menu.AddItem(new GUIContent("Clear Assets"), false, () => InventoryGroups.ClearGroup(groupPath, includeSubgroups: false));
+            menu.AddSeparator("");
+            menu.AddItem(new GUIContent("Delete Group…"), false, () =>
+            {
+                bool hasSub = InventoryGroups.HasSubgroups(groupPath);
+                string msg = hasSub
+                    ? $"Delete group \"{groupPath}\" and all its sub-groups?\n\n(Project assets will not be modified or deleted.)"
+                    : $"Delete group \"{groupPath}\"?\n\n(Project assets will not be modified or deleted.)";
+                if (EditorUtility.DisplayDialog("Delete Inventory Group", msg, "Delete", "Cancel"))
+                    InventoryGroups.DeleteGroup(groupPath);
+            });
+            menu.ShowAsContext();
+        }
+
         bool SidebarRow(string label, int count, bool selected, Texture icon)
         {
             var r = GUILayoutUtility.GetRect(0, 18, GUILayout.ExpandWidth(true));
@@ -478,6 +1016,8 @@ namespace ProjectInventory.Editor
         {
             searchText = "";
             categoryMask = 0;
+            groupFilter = "";
+            excludedGroups.Clear();
             folderFilter = "";
             labelFilter = "";
             minSizeIndex = 0;
@@ -491,10 +1031,37 @@ namespace ProjectInventory.Editor
             public bool Negate;
         }
 
+        static List<string> SplitSearchTokens(string input)
+        {
+            var tokens = new List<string>();
+            if (string.IsNullOrWhiteSpace(input)) return tokens;
+
+            var sb = new System.Text.StringBuilder();
+            bool inQuotes = false;
+            for (int i = 0; i < input.Length; i++)
+            {
+                char c = input[i];
+                if (c == '"')
+                {
+                    inQuotes = !inQuotes;
+                }
+                else if (char.IsWhiteSpace(c) && !inQuotes)
+                {
+                    if (sb.Length > 0) { tokens.Add(sb.ToString()); sb.Clear(); }
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            if (sb.Length > 0) tokens.Add(sb.ToString());
+            return tokens;
+        }
+
         void RefreshFilter()
         {
             var terms = new List<Term>();
-            foreach (var raw in (searchText ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            foreach (var raw in SplitSearchTokens(searchText))
             {
                 var t = new Term { Value = raw };
                 if (t.Value.StartsWith("-") && t.Value.Length > 1) { t.Negate = true; t.Value = t.Value.Substring(1); }
@@ -533,6 +1100,22 @@ namespace ProjectInventory.Editor
         bool Matches(InventoryItem i, List<Term> terms, long minSize)
         {
             if (categoryMask != 0 && (categoryMask & (1 << (int)i.Category)) == 0) return false;
+            if (!string.IsNullOrEmpty(groupFilter))
+            {
+                if (groupFilter == UngroupedFilter)
+                {
+                    if (!InventoryGroups.IsUngrouped(i.Guid)) return false;
+                }
+                else if (!InventoryGroups.Contains(groupFilter, i.Guid, includeSubgroups: true))
+                {
+                    return false;
+                }
+            }
+            for (int exIdx = 0; exIdx < excludedGroups.Count; exIdx++)
+            {
+                if (InventoryGroups.Contains(excludedGroups[exIdx], i.Guid, includeSubgroups: true))
+                    return false;
+            }
             if (!string.IsNullOrEmpty(folderFilter) && !i.Path.StartsWith(folderFilter + "/", StringComparison.Ordinal)) return false;
             if (!string.IsNullOrEmpty(labelFilter) && Array.IndexOf(i.Labels, labelFilter) < 0) return false;
             if (i.Size < minSize) return false;
@@ -544,6 +1127,7 @@ namespace ProjectInventory.Editor
                 bool hit = t.Key switch
                 {
                     "t" => i.Category.ToString().IndexOf(t.Value, oic) >= 0 || i.TypeName.IndexOf(t.Value, oic) >= 0,
+                    "g" or "group" => InventoryGroups.GetGroupsForAsset(i.Guid).Any(g => g.IndexOf(t.Value, oic) >= 0),
                     "l" => i.Labels.Any(l => l.IndexOf(t.Value, oic) >= 0),
                     "ext" => string.Equals(i.Extension, t.Value.TrimStart('.'), oic),
                     "dir" => i.Folder.IndexOf(t.Value, oic) >= 0,
@@ -651,10 +1235,40 @@ namespace ProjectInventory.Editor
 
             // header
             var header = new Rect(area.x, area.y, area.width, ListRowHeight);
-            float nameW = Mathf.Max(120, viewW * 0.35f);
-            float[] widths = { nameW, 110, 70, 120, Mathf.Max(60, viewW - nameW - 300) };
-            string[] titles = { "Name", "Type", "Size", "Modified", "Folder" };
-            SortMode[] modes = { SortMode.Name, SortMode.Type, SortMode.Size, SortMode.Modified, SortMode.Path };
+            float nameW;
+            float[] widths;
+            string[] titles;
+            SortMode[] modes;
+
+            if (viewW < 280f)
+            {
+                float sizeW = 60f;
+                nameW = Mathf.Max(80f, viewW - sizeW);
+                widths = new[] { nameW, sizeW };
+                titles = new[] { "Name", "Size" };
+                modes = new[] { SortMode.Name, SortMode.Size };
+            }
+            else if (viewW < 440f)
+            {
+                float typeW = 80f;
+                float sizeW = 60f;
+                nameW = Mathf.Max(90f, viewW - typeW - sizeW);
+                widths = new[] { nameW, typeW, sizeW };
+                titles = new[] { "Name", "Type", "Size" };
+                modes = new[] { SortMode.Name, SortMode.Type, SortMode.Size };
+            }
+            else
+            {
+                nameW = Mathf.Max(120f, viewW * 0.35f);
+                float typeW = 100f;
+                float sizeW = 65f;
+                float modW = 110f;
+                float folderW = Mathf.Max(50f, viewW - nameW - typeW - sizeW - modW);
+                widths = new[] { nameW, typeW, sizeW, modW, folderW };
+                titles = new[] { "Name", "Type", "Size", "Modified", "Folder" };
+                modes = new[] { SortMode.Name, SortMode.Type, SortMode.Size, SortMode.Modified, SortMode.Path };
+            }
+
             GUI.Box(header, GUIContent.none, EditorStyles.toolbar);
             float hx = header.x + 4;
             for (int i = 0; i < titles.Length; i++)
@@ -690,13 +1304,27 @@ namespace ProjectInventory.Editor
                     if (icon != null) GUI.DrawTexture(new Rect(x, row.y + 2, 16, 16), icon, ScaleMode.ScaleToFit);
                     GUI.Label(new Rect(x + 20, row.y, widths[0] - 22, row.height), item.Name);
                     x += widths[0];
-                    GUI.Label(new Rect(x, row.y, widths[1], row.height), ObjectNames.NicifyVariableName(item.Category.ToString()), EditorStyles.miniLabel);
-                    x += widths[1];
-                    GUI.Label(new Rect(x, row.y, widths[2], row.height), InventoryItem.FormatSize(item.Size), EditorStyles.miniLabel);
-                    x += widths[2];
-                    GUI.Label(new Rect(x, row.y, widths[3], row.height), item.Modified.ToString("yyyy-MM-dd HH:mm"), EditorStyles.miniLabel);
-                    x += widths[3];
-                    GUI.Label(new Rect(x, row.y, widths[4], row.height), item.Folder, EditorStyles.miniLabel);
+
+                    if (widths.Length == 2)
+                    {
+                        GUI.Label(new Rect(x, row.y, widths[1], row.height), InventoryItem.FormatSize(item.Size), EditorStyles.miniLabel);
+                    }
+                    else if (widths.Length == 3)
+                    {
+                        GUI.Label(new Rect(x, row.y, widths[1], row.height), ObjectNames.NicifyVariableName(item.Category.ToString()), EditorStyles.miniLabel);
+                        x += widths[1];
+                        GUI.Label(new Rect(x, row.y, widths[2], row.height), InventoryItem.FormatSize(item.Size), EditorStyles.miniLabel);
+                    }
+                    else
+                    {
+                        GUI.Label(new Rect(x, row.y, widths[1], row.height), ObjectNames.NicifyVariableName(item.Category.ToString()), EditorStyles.miniLabel);
+                        x += widths[1];
+                        GUI.Label(new Rect(x, row.y, widths[2], row.height), InventoryItem.FormatSize(item.Size), EditorStyles.miniLabel);
+                        x += widths[2];
+                        GUI.Label(new Rect(x, row.y, widths[3], row.height), item.Modified.ToString("yyyy-MM-dd HH:mm"), EditorStyles.miniLabel);
+                        x += widths[3];
+                        GUI.Label(new Rect(x, row.y, widths[4], row.height), item.Folder, EditorStyles.miniLabel);
+                    }
                 }
                 HandleItemEvents(row, item, idx);
             }
@@ -919,6 +1547,7 @@ namespace ProjectInventory.Editor
         {
             var items = SelectedItems();
             if (items.Count == 0) return;
+            var guids = items.Select(i => i.Guid).ToList();
             var menu = new GenericMenu();
             menu.AddItem(new GUIContent("Open"), false, () => OpenAssets(items));
             menu.AddItem(new GUIContent("Ping in Project"), false, PingSelection);
@@ -926,12 +1555,44 @@ namespace ProjectInventory.Editor
             menu.AddItem(new GUIContent(Application.platform == RuntimePlatform.OSXEditor ? "Reveal in Finder" : "Show in Explorer"),
                 false, () => EditorUtility.RevealInFinder(items[0].Path));
             menu.AddSeparator("");
+
+            foreach (var g in InventoryGroups.AllGroups)
+            {
+                string groupPath = g;
+                string menuLabel = "Groups/" + groupPath.Replace("/", " ▸ ");
+                bool allInGroup = items.All(i => InventoryGroups.Contains(groupPath, i.Guid, includeSubgroups: false));
+                menu.AddItem(new GUIContent(menuLabel), allInGroup, () =>
+                {
+                    if (allInGroup) InventoryGroups.RemoveAssets(groupPath, guids, includeSubgroups: false);
+                    else InventoryGroups.AddAssets(groupPath, guids);
+                });
+            }
+            if (InventoryGroups.GroupCount > 0) menu.AddSeparator("Groups/");
+            menu.AddItem(new GUIContent("Groups/New Group with Selection…"), false, () => StartCreateGroup("", guids));
+
+            if (!string.IsNullOrEmpty(groupFilter) && groupFilter != UngroupedFilter)
+            {
+                string activeGroup = groupFilter;
+                menu.AddItem(new GUIContent($"Remove from \"{activeGroup.Replace("/", " ▸ ")}\""), false,
+                    () => InventoryGroups.RemoveAssets(activeGroup, guids, includeSubgroups: true));
+            }
+
+            menu.AddSeparator("");
             menu.AddItem(new GUIContent("Copy Path"), false, () => EditorGUIUtility.systemCopyBuffer = string.Join("\n", items.Select(i => i.Path)));
             menu.AddItem(new GUIContent("Copy GUID"), false, () => EditorGUIUtility.systemCopyBuffer = string.Join("\n", items.Select(i => i.Guid)));
             menu.AddSeparator("");
             menu.AddItem(new GUIContent("Filter/Same Folder"), false, () => { folderFilter = items[0].Folder; filterDirty = true; });
             menu.AddItem(new GUIContent("Filter/Same Type"), false, () => { categoryMask = 1 << (int)items[0].Category; filterDirty = true; });
             menu.AddItem(new GUIContent("Filter/Same Extension"), false, () => { searchText = "ext:" + items[0].Extension; filterDirty = true; });
+            foreach (var g in InventoryGroups.GetGroupsForAsset(items[0].Guid))
+            {
+                string gp = g;
+                string nice = gp.Replace("/", " ▸ ");
+                menu.AddItem(new GUIContent("Filter/Group: " + nice), false,
+                    () => { excludedGroups.RemoveAll(x => string.Equals(x, gp, StringComparison.OrdinalIgnoreCase)); groupFilter = gp; filterDirty = true; });
+                menu.AddItem(new GUIContent("Filter/Exclude Group: " + nice), IsGroupExcluded(gp),
+                    () => ToggleGroupExcluded(gp));
+            }
             menu.AddSeparator("");
             menu.AddItem(new GUIContent("Delete…"), false, DeleteSelection);
             menu.ShowAsContext();
@@ -1220,6 +1881,11 @@ namespace ProjectInventory.Editor
             foreach (var kv in extraInfo) EditorGUILayout.LabelField(kv.Key, kv.Value);
 
             GUILayout.Space(6);
+            SectionLabel("Groups");
+            DrawGroupChips(new[] { item });
+            DrawAddGroup(new[] { item });
+
+            GUILayout.Space(6);
             SectionLabel("Labels");
             DrawLabelChips(item);
             DrawAddLabel(new[] { item });
@@ -1277,8 +1943,99 @@ namespace ProjectInventory.Editor
             }
 
             GUILayout.Space(6);
+            SectionLabel("Groups");
+            DrawGroupChips(items);
+            DrawAddGroup(items);
+
+            GUILayout.Space(6);
             SectionLabel("Add Label To All");
             DrawAddLabel(items);
+        }
+
+        void DrawGroupChips(IReadOnlyList<InventoryItem> items)
+        {
+            var sharedGroups = items
+                .SelectMany(i => InventoryGroups.GetGroupsForAsset(i.Guid))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(g => g, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (sharedGroups.Count == 0)
+            {
+                GUILayout.Label("No groups", EditorStyles.miniLabel);
+                return;
+            }
+
+            string remove = null;
+            string filterTo = null;
+            string excludeTo = null;
+            foreach (var g in sharedGroups)
+            {
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button(new GUIContent(g, "Click to filter by this group · Alt-click to exclude"), EditorStyles.miniButtonLeft, GUILayout.ExpandWidth(false)))
+                    {
+                        if (Event.current.alt) excludeTo = g;
+                        else filterTo = g;
+                    }
+                    if (GUILayout.Button(new GUIContent("×", "Remove from group"), EditorStyles.miniButtonRight, GUILayout.Width(20)))
+                        remove = g;
+                    GUILayout.FlexibleSpace();
+                }
+            }
+            if (excludeTo != null)
+            {
+                ToggleGroupExcluded(excludeTo);
+            }
+            else if (filterTo != null)
+            {
+                excludedGroups.RemoveAll(x => string.Equals(x, filterTo, StringComparison.OrdinalIgnoreCase));
+                groupFilter = filterTo;
+                filterDirty = true;
+            }
+            if (remove != null)
+            {
+                InventoryGroups.RemoveAssets(remove, items.Select(i => i.Guid), includeSubgroups: false);
+            }
+        }
+
+        void DrawAddGroup(IEnumerable<InventoryItem> items)
+        {
+            var list = items as IList<InventoryItem> ?? items.ToList();
+            var e = Event.current;
+            bool enterPressed = e.type == EventType.KeyDown &&
+                                (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter) &&
+                                GUI.GetNameOfFocusedControl() == "DetailsAddGroupField";
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                GUI.SetNextControlName("DetailsAddGroupField");
+                newGroup = EditorGUILayout.TextField(newGroup);
+                if (GUILayout.Button("Add", EditorStyles.miniButton, GUILayout.Width(40)) || enterPressed)
+                {
+                    if (enterPressed) e.Use();
+                    AddGroupToItems(list, newGroup);
+                }
+                if (InventoryGroups.GroupCount > 0 && GUILayout.Button("▾", EditorStyles.miniButton, GUILayout.Width(20)))
+                {
+                    var menu = new GenericMenu();
+                    foreach (var g in InventoryGroups.AllGroups)
+                    {
+                        string gp = g;
+                        menu.AddItem(new GUIContent(gp.Replace("/", " ▸ ")), false, () => AddGroupToItems(list, gp));
+                    }
+                    menu.ShowAsContext();
+                }
+            }
+        }
+
+        void AddGroupToItems(IEnumerable<InventoryItem> items, string groupPath)
+        {
+            groupPath = InventoryGroups.NormalizePath(groupPath);
+            if (string.IsNullOrEmpty(groupPath)) return;
+            InventoryGroups.AddAssets(groupPath, items.Select(i => i.Guid));
+            ExpandAncestors(groupPath);
+            newGroup = "";
         }
 
         void DrawLabelChips(InventoryItem item)
@@ -1358,15 +2115,47 @@ namespace ProjectInventory.Editor
             {
                 long total = 0;
                 foreach (var i in filtered) total += i.Size;
-                GUILayout.Label($"{filtered.Count:N0} of {InventoryIndex.Items.Count:N0} assets · {InventoryItem.FormatSize(total)}",
-                    EditorStyles.miniLabel);
-                if (selection.Count > 0) GUILayout.Label($"· {selection.Count} selected", EditorStyles.miniLabel);
-                GUILayout.FlexibleSpace();
-                if (InventoryIndex.HasReferenceData && InventoryIndex.ReferencesStale)
+
+                string fullStats = $"{filtered.Count:N0} of {InventoryIndex.Items.Count:N0} assets · {InventoryItem.FormatSize(total)}";
+                string selStats = selection.Count > 0 ? $" · {selection.Count} selected" : "";
+                string indexTime = "Indexed " + InventoryIndex.LastScan.ToString("HH:mm:ss");
+
+                if (rect.width >= 460f)
                 {
-                    if (GUILayout.Button("References outdated – rescan", EditorStyles.toolbarButton)) ScanReferences();
+                    GUILayout.Label(fullStats, EditorStyles.miniLabel);
+                    if (selection.Count > 0) GUILayout.Label(selStats, EditorStyles.miniLabel);
+                    GUILayout.FlexibleSpace();
+                    if (InventoryIndex.HasReferenceData && InventoryIndex.ReferencesStale)
+                    {
+                        if (GUILayout.Button("References outdated – rescan", EditorStyles.toolbarButton)) ScanReferences();
+                    }
+                    GUILayout.Label(indexTime, EditorStyles.miniLabel);
                 }
-                GUILayout.Label("Indexed " + InventoryIndex.LastScan.ToString("HH:mm:ss"), EditorStyles.miniLabel);
+                else if (rect.width >= 320f)
+                {
+                    string compactStats = $"{filtered.Count:N0}/{InventoryIndex.Items.Count:N0} · {InventoryItem.FormatSize(total)}";
+                    GUILayout.Label(new GUIContent(compactStats, fullStats + "\n" + indexTime), EditorStyles.miniLabel);
+                    if (selection.Count > 0) GUILayout.Label($"· {selection.Count} sel", EditorStyles.miniLabel);
+                    GUILayout.FlexibleSpace();
+                    if (InventoryIndex.HasReferenceData && InventoryIndex.ReferencesStale)
+                    {
+                        if (GUILayout.Button(new GUIContent("Rescan", "References outdated – click to rescan"), EditorStyles.toolbarButton, GUILayout.Width(54)))
+                            ScanReferences();
+                    }
+                    GUILayout.Label(InventoryIndex.LastScan.ToString("HH:mm:ss"), EditorStyles.miniLabel);
+                }
+                else
+                {
+                    string tinyStats = $"{filtered.Count:N0}/{InventoryIndex.Items.Count:N0}";
+                    if (selection.Count > 0) tinyStats += $" ({selection.Count})";
+                    GUILayout.Label(new GUIContent(tinyStats, fullStats + selStats + "\n" + indexTime), EditorStyles.miniLabel);
+                    GUILayout.FlexibleSpace();
+                    if (InventoryIndex.HasReferenceData && InventoryIndex.ReferencesStale)
+                    {
+                        if (GUILayout.Button(new GUIContent("Rescan", "References outdated – click to rescan"), EditorStyles.toolbarButton, GUILayout.Width(54)))
+                            ScanReferences();
+                    }
+                }
             }
             GUILayout.EndArea();
         }
